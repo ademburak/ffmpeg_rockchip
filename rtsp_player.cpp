@@ -142,6 +142,52 @@ int main(int argc, char* argv[]) {
         decoder = avcodec_find_decoder_by_name(hw_decoders);
         if (decoder) {
             std::cout << "Trying hardware decoder: " << hw_decoders << std::endl;
+            
+            // Setup decoder with additional options
+            AVCodecContext* dec_ctx = avcodec_alloc_context3(decoder);
+            if (dec_ctx) {
+                // Copy parameters from software context
+                if (avcodec_parameters_to_context(dec_ctx, fmt_ctx->streams[video_stream_index]->codecpar) >= 0) {
+                    // Set thread count for decoding
+                    dec_ctx->thread_count = 4;
+                    dec_ctx->thread_type = FF_THREAD_FRAME;
+                    
+                    // Additional decoder options
+                    AVDictionary* decoder_opts = nullptr;
+                    av_dict_set(&decoder_opts, "threads", "4", 0);
+                    av_dict_set(&decoder_opts, "zerocopy", "1", 0);
+                    av_dict_set(&decoder_opts, "refcounted_frames", "1", 0);
+                    av_dict_set(&decoder_opts, "skip_loop_filter", "48", 0);
+                    av_dict_set(&decoder_opts, "skip_frame", "0", 0);
+                    av_dict_set(&decoder_opts, "strict", "experimental", 0);
+
+                    // Add hardware-specific options
+                    if (strstr(decoder->name, "rkmpp")) {
+                        av_dict_set(&decoder_opts, "zerocopy", "1", 0);
+                        // Add H.264 specific options
+                        if (codec_id == AV_CODEC_ID_H264) {
+                            av_dict_set(&decoder_opts, "flags2", "+export_mvs", 0);
+                            av_dict_set(&decoder_opts, "flags", "+low_delay", 0);
+                            av_dict_set(&decoder_opts, "flags2", "+fast", 0);
+                        }
+                    }
+
+                    // Try to open hardware decoder
+                    if (avcodec_open2(dec_ctx, decoder, &decoder_opts) >= 0) {
+                        std::cout << "Successfully opened hardware decoder" << std::endl;
+                        fmt_ctx->streams[video_stream_index]->codec = dec_ctx;
+                    } else {
+                        std::cout << "Failed to open hardware decoder, falling back to software" << std::endl;
+                        avcodec_free_context(&dec_ctx);
+                        decoder = nullptr;
+                    }
+                    av_dict_free(&decoder_opts);
+                } else {
+                    std::cout << "Failed to copy parameters to hardware context, falling back to software" << std::endl;
+                    avcodec_free_context(&dec_ctx);
+                    decoder = nullptr;
+                }
+            }
         }
     }
 
@@ -153,48 +199,36 @@ int main(int argc, char* argv[]) {
             return -1;
         }
         std::cout << "Using software decoder: " << decoder->name << std::endl;
-    }
 
-    // Setup decoder with additional options
-    AVCodecContext* dec_ctx = avcodec_alloc_context3(decoder);
-    if (!dec_ctx) {
-        std::cerr << "Could not allocate decoder context" << std::endl;
-        return -1;
-    }
-
-    avcodec_parameters_to_context(dec_ctx, fmt_ctx->streams[video_stream_index]->codecpar);
-    
-    // Set thread count for decoding
-    dec_ctx->thread_count = 4;
-    dec_ctx->thread_type = FF_THREAD_FRAME;
-    
-    // Additional decoder options
-    AVDictionary* decoder_opts = nullptr;
-    av_dict_set(&decoder_opts, "threads", "4", 0);
-    av_dict_set(&decoder_opts, "zerocopy", "1", 0);
-    av_dict_set(&decoder_opts, "refcounted_frames", "1", 0);
-    av_dict_set(&decoder_opts, "skip_loop_filter", "48", 0);
-    av_dict_set(&decoder_opts, "skip_frame", "0", 0);
-    av_dict_set(&decoder_opts, "strict", "normal", 0);
-
-    // Add hardware-specific options
-    if (strstr(decoder->name, "rkmpp")) {
-        av_dict_set(&decoder_opts, "zerocopy", "1", 0);
-        // Add H.264 specific options
-        if (codec_id == AV_CODEC_ID_H264) {
-            av_dict_set(&decoder_opts, "flags2", "+export_mvs", 0);
-            av_dict_set(&decoder_opts, "flags", "+low_delay", 0);
-            av_dict_set(&decoder_opts, "flags2", "+fast", 0);
-            av_dict_set(&decoder_opts, "strict", "experimental", 0);
+        // Setup decoder with additional options
+        AVCodecContext* dec_ctx = avcodec_alloc_context3(decoder);
+        if (!dec_ctx) {
+            std::cerr << "Could not allocate decoder context" << std::endl;
+            return -1;
         }
-    }
 
-    if (avcodec_open2(dec_ctx, decoder, &decoder_opts) < 0) {
-        std::cerr << "Could not open decoder" << std::endl;
+        avcodec_parameters_to_context(dec_ctx, fmt_ctx->streams[video_stream_index]->codecpar);
+        
+        // Set thread count for decoding
+        dec_ctx->thread_count = 4;
+        dec_ctx->thread_type = FF_THREAD_FRAME;
+        
+        // Additional decoder options
+        AVDictionary* decoder_opts = nullptr;
+        av_dict_set(&decoder_opts, "threads", "4", 0);
+        av_dict_set(&decoder_opts, "refcounted_frames", "1", 0);
+        av_dict_set(&decoder_opts, "skip_loop_filter", "48", 0);
+        av_dict_set(&decoder_opts, "skip_frame", "0", 0);
+        av_dict_set(&decoder_opts, "strict", "normal", 0);
+
+        if (avcodec_open2(dec_ctx, decoder, &decoder_opts) < 0) {
+            std::cerr << "Could not open decoder" << std::endl;
+            av_dict_free(&decoder_opts);
+            return -1;
+        }
         av_dict_free(&decoder_opts);
-        return -1;
+        fmt_ctx->streams[video_stream_index]->codec = dec_ctx;
     }
-    av_dict_free(&decoder_opts);
 
     std::cout << "Successfully opened decoder: " << decoder->name << std::endl;
     std::cout << "Video dimensions: " << dec_ctx->width << "x" << dec_ctx->height << std::endl;

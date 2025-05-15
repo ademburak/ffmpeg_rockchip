@@ -21,9 +21,12 @@ docker run -it --rm \
     $DEVICE_OPTS \
     --group-add=video \
     --cap-add=SYS_NICE \
+    --privileged \
     -v /tmp/.X11-unix:/tmp/.X11-unix \
     -v /usr/lib/aarch64-linux-gnu:/usr/lib/aarch64-linux-gnu \
     -v /proc/device-tree:/proc/device-tree \
+    -v /sys:/sys \
+    -v /dev:/dev \
     -v "$(pwd)/output:/tmp" \
     -e DISPLAY=$DISPLAY \
     -e MPP_DEBUG=1 \
@@ -33,4 +36,7 @@ docker run -it --rm \
     -e MPP_USE_DRM_RENDER=1 \
     -e MPP_DEC_FORCE_SOFTWARE=0 \
     -e MPP_DEC_FORCE_HARDWARE=1 \
+    -e MPP_SOC_TYPE=rk3588 \
+    -e MPP_HW_DEC=1 \
+    -e MPP_HW_ENC=1 \
     rtsp_player "$@" 

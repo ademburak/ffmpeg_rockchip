@@ -1,0 +1,8 @@
+output.mp4
+output/
+*.mp4
+*.mp3
+*.jpg
+*.png
+*.jpeg
+*.gif
