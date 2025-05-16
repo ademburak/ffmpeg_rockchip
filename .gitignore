@@ -7,3 +7,4 @@ output/
 *.jpeg
 *.gif
 cap_ffmpeg_impl.hpp
+rtsp_player
