@@ -14,6 +14,7 @@ extern "C" {
 #include <fstream>
 #include <sstream>
 #include <iomanip>
+#include <ctime>
 
 // Function to get CPU usage
 double get_cpu_usage() {
@@ -51,22 +52,44 @@ double get_cpu_usage() {
 
 int main(int argc, char* argv[]) {
     if (argc < 2) {
-        std::cerr << "Usage: ./rtsp_player <rtsp_url> [--no-record] [--no-resize] [output_file.mp4]" << std::endl;
+        std::cerr << "Usage: ./rtsp_player <rtsp_url> [--no-record] [--no-resize] [--color-format=bgr|yuv|nv12] [output_file.mp4]" << std::endl;
         return -1;
     }
 
     const char* rtsp_url = argv[1];
     bool no_record = false;
     bool no_resize = false;
+    bool use_bgr = false;  // Default to YUV format
+    bool use_nv12 = false;
     const char* output_file = "output.mp4";
 
     // Parse arguments
     for (int i = 2; i < argc; i++) {
         std::string arg = argv[i];
+        std::cout << "Processing argument: " << arg << std::endl;  // Debug output
         if (arg == "--no-record") {
             no_record = true;
         } else if (arg == "--no-resize") {
             no_resize = true;
+        } else if (arg.find("--color-format=") == 0) {
+            std::string format = arg.substr(15);  // Length of "--color-format=" is 15
+            std::cout << "Parsing color format: " << format << std::endl;  // Debug output
+            if (format == "yuv") {
+                use_bgr = false;
+                use_nv12 = false;
+                std::cout << "Setting color format to YUV" << std::endl;
+            } else if (format == "nv12") {
+                use_bgr = false;
+                use_nv12 = true;
+                std::cout << "Setting color format to NV12" << std::endl;
+            } else if (format == "bgr") {
+                use_bgr = true;
+                use_nv12 = false;
+                std::cout << "Setting color format to BGR" << std::endl;
+            } else {
+                std::cerr << "Invalid color format. Use 'bgr', 'yuv', or 'nv12'" << std::endl;
+                return -1;
+            }
         } else if (arg[0] != '-') {  // Only treat non-option arguments as output file
             output_file = argv[i];
         }
@@ -83,6 +106,7 @@ int main(int argc, char* argv[]) {
     } else {
         std::cout << "Running with frame resizing (800x600)" << std::endl;
     }
+    std::cout << "Color format: " << (use_bgr ? "BGR" : (use_nv12 ? "NV12" : "YUV")) << std::endl;
 
     avformat_network_init();
 
@@ -117,6 +141,7 @@ int main(int argc, char* argv[]) {
     // Find video stream
     int video_stream_index = -1;
     AVCodec* decoder = nullptr;
+    AVCodecContext* dec_ctx = nullptr;  // Declare dec_ctx at the top level
     
     // First find the video stream
     video_stream_index = av_find_best_stream(fmt_ctx, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
@@ -144,7 +169,7 @@ int main(int argc, char* argv[]) {
             std::cout << "Trying hardware decoder: " << hw_decoders << std::endl;
             
             // Setup decoder with additional options
-            AVCodecContext* dec_ctx = avcodec_alloc_context3(decoder);
+            dec_ctx = avcodec_alloc_context3(decoder);
             if (dec_ctx) {
                 // Copy parameters from software context
                 if (avcodec_parameters_to_context(dec_ctx, fmt_ctx->streams[video_stream_index]->codecpar) >= 0) {
@@ -175,7 +200,6 @@ int main(int argc, char* argv[]) {
                     // Try to open hardware decoder
                     if (avcodec_open2(dec_ctx, decoder, &decoder_opts) >= 0) {
                         std::cout << "Successfully opened hardware decoder" << std::endl;
-                        fmt_ctx->streams[video_stream_index]->codec = dec_ctx;
                     } else {
                         std::cout << "Failed to open hardware decoder, falling back to software" << std::endl;
                         avcodec_free_context(&dec_ctx);
@@ -201,7 +225,7 @@ int main(int argc, char* argv[]) {
         std::cout << "Using software decoder: " << decoder->name << std::endl;
 
         // Setup decoder with additional options
-        AVCodecContext* dec_ctx = avcodec_alloc_context3(decoder);
+        dec_ctx = avcodec_alloc_context3(decoder);
         if (!dec_ctx) {
             std::cerr << "Could not allocate decoder context" << std::endl;
             return -1;
@@ -227,7 +251,6 @@ int main(int argc, char* argv[]) {
             return -1;
         }
         av_dict_free(&decoder_opts);
-        fmt_ctx->streams[video_stream_index]->codec = dec_ctx;
     }
 
     std::cout << "Successfully opened decoder: " << decoder->name << std::endl;
@@ -348,10 +371,24 @@ int main(int argc, char* argv[]) {
     SwsContext* sws_ctx = nullptr;
     std::vector<uint8_t> buffer;
 
+    // Timing variables
+    double total_conversion_time = 0.0;
+    int conversion_count = 0;
+    struct timespec start_time, end_time;
+
+    AVPixelFormat target_format;
+    if (use_bgr) {
+        target_format = AV_PIX_FMT_BGR24;
+    } else if (use_nv12) {
+        target_format = AV_PIX_FMT_NV12;
+    } else {
+        target_format = dec_ctx->pix_fmt;  // Keep original YUV format
+    }
+
     if (!no_resize) {
         sws_ctx = sws_getContext(
             dec_ctx->width, dec_ctx->height, dec_ctx->pix_fmt,
-            target_width, target_height, AV_PIX_FMT_BGR24,
+            target_width, target_height, target_format,
             SWS_BILINEAR, nullptr, nullptr, nullptr
         );
         if (!sws_ctx) {
@@ -359,16 +396,49 @@ int main(int argc, char* argv[]) {
             return -1;
         }
 
-        int num_bytes = av_image_get_buffer_size(AV_PIX_FMT_BGR24, target_width, target_height, 1);
+        int num_bytes = av_image_get_buffer_size(target_format, 
+                                               target_width, target_height, 1);
         buffer.resize(num_bytes);
         av_image_fill_arrays(rgb_frame->data, rgb_frame->linesize, buffer.data(),
-                            AV_PIX_FMT_BGR24, target_width, target_height, 1);
+                            target_format, 
+                            target_width, target_height, 1);
     } else {
         // Use original dimensions and format
-        int num_bytes = av_image_get_buffer_size(dec_ctx->pix_fmt, dec_ctx->width, dec_ctx->height, 1);
+        int num_bytes = av_image_get_buffer_size(target_format, 
+                                               dec_ctx->width, dec_ctx->height, 1);
         buffer.resize(num_bytes);
-        av_image_fill_arrays(rgb_frame->data, rgb_frame->linesize, buffer.data(),
-                            dec_ctx->pix_fmt, dec_ctx->width, dec_ctx->height, 1);
+        
+        // Properly initialize the frame
+        rgb_frame->format = target_format;
+        rgb_frame->width = dec_ctx->width;
+        rgb_frame->height = dec_ctx->height;
+        
+        // Allocate the frame buffer
+        int ret = av_frame_get_buffer(rgb_frame, 32);  // 32-byte alignment
+        if (ret < 0) {
+            std::cerr << "Could not allocate frame buffer" << std::endl;
+            return -1;
+        }
+        
+        // Make sure the frame is writable
+        ret = av_frame_make_writable(rgb_frame);
+        if (ret < 0) {
+            std::cerr << "Could not make frame writable" << std::endl;
+            return -1;
+        }
+
+        // Only create SwsContext if we need format conversion
+        if (target_format != dec_ctx->pix_fmt) {
+            sws_ctx = sws_getContext(
+                dec_ctx->width, dec_ctx->height, dec_ctx->pix_fmt,
+                dec_ctx->width, dec_ctx->height, target_format,
+                SWS_BILINEAR, nullptr, nullptr, nullptr
+            );
+            if (!sws_ctx) {
+                std::cerr << "Could not initialize SwsContext" << std::endl;
+                return -1;
+            }
+        }
     }
 
     std::cout << "Starting video processing..." << std::endl;
@@ -382,7 +452,7 @@ int main(int argc, char* argv[]) {
         return -1;
     }
 
-    int64_t start_time = av_gettime();
+    int64_t start_time_total = av_gettime();
     int64_t max_duration = 10 * 1000000; // 10 seconds in microseconds
     int frame_count = 0;
     double total_cpu_usage = 0.0;
@@ -391,14 +461,14 @@ int main(int argc, char* argv[]) {
     const int max_errors = 10;
     int64_t last_cpu_check = 0;
     const int64_t cpu_check_interval = 100000; // Check CPU every 100ms
-    int64_t last_fps_time = start_time;
+    int64_t last_fps_time = start_time_total;
     int fps_frame_count = 0;
     double current_fps = 0.0;
 
     while (av_read_frame(fmt_ctx, pkt) >= 0) {
         // Check if we've exceeded the time limit
         int64_t current_time = av_gettime();
-        if (current_time - start_time > max_duration) {
+        if (current_time - start_time_total > max_duration) {
             std::cout << "\nReached maximum duration (10 seconds)" << std::endl;
             break;
         }
@@ -439,30 +509,23 @@ int main(int argc, char* argv[]) {
                     break;
                 }
 
+                // Start timing the conversion
+                clock_gettime(CLOCK_MONOTONIC, &start_time);
+
                 if (!no_resize) {
                     // Resize frame
                     sws_scale(sws_ctx,
                             frame->data, frame->linesize, 0, dec_ctx->height,
                             rgb_frame->data, rgb_frame->linesize);
                 } else {
-                    // For no-resize mode, we need to ensure the frame formats match
-                    if (frame->format != rgb_frame->format) {
-                        // Create a temporary conversion context
-                        SwsContext* temp_sws = sws_getContext(
-                            frame->width, frame->height, (AVPixelFormat)frame->format,
-                            frame->width, frame->height, (AVPixelFormat)frame->format,
-                            SWS_BILINEAR, nullptr, nullptr, nullptr
-                        );
-                        if (temp_sws) {
-                            // Convert frame to the same format
-                            sws_scale(temp_sws,
-                                    frame->data, frame->linesize, 0, frame->height,
-                                    rgb_frame->data, rgb_frame->linesize);
-                            sws_freeContext(temp_sws);
-                        } else {
-                            std::cerr << "Error creating temporary conversion context" << std::endl;
-                            break;
-                        }
+                    // For no-resize mode, use OpenCV's cvtColor for YUV to BGR conversion
+                    if (use_bgr) {
+                        // Create OpenCV Mat from YUV frame
+                        cv::Mat yuv(dec_ctx->height * 3/2, dec_ctx->width, CV_8UC1, frame->data[0]);
+                        cv::Mat bgr(dec_ctx->height, dec_ctx->width, CV_8UC3, rgb_frame->data[0]);
+                        
+                        // Convert YUV to BGR using OpenCV
+                        cv::cvtColor(yuv, bgr, cv::COLOR_YUV2BGR_I420);
                     } else {
                         // If formats match, just copy the frame
                         if (av_frame_copy(rgb_frame, frame) < 0) {
@@ -471,6 +534,13 @@ int main(int argc, char* argv[]) {
                         }
                     }
                 }
+
+                // End timing the conversion
+                clock_gettime(CLOCK_MONOTONIC, &end_time);
+                double conversion_time = (end_time.tv_sec - start_time.tv_sec) * 1000.0 +
+                                      (end_time.tv_nsec - start_time.tv_nsec) / 1000000.0;  // Convert to milliseconds
+                total_conversion_time += conversion_time;
+                conversion_count++;
 
                 if (!no_record) {
                     // Set frame timestamp
@@ -527,9 +597,11 @@ int main(int argc, char* argv[]) {
                     double cpu_usage = get_cpu_usage();
                     total_cpu_usage += cpu_usage;
                     cpu_samples++;
+                    double avg_conversion_time = conversion_count > 0 ? total_conversion_time / conversion_count : 0.0;
                     std::cout << "\rFrames processed: " << frame_count 
                              << " CPU Usage: " << cpu_usage << "%"
-                             << " FPS: " << std::fixed << std::setprecision(1) << current_fps << std::flush;
+                             << " FPS: " << std::fixed << std::setprecision(1) << current_fps
+                             << " Avg conversion time: " << std::fixed << std::setprecision(3) << avg_conversion_time << "ms" << std::flush;
                     last_cpu_check = current_time;
                 }
             }
@@ -575,13 +647,16 @@ int main(int argc, char* argv[]) {
 
     // Calculate and display average CPU usage and FPS
     double avg_cpu_usage = cpu_samples > 0 ? total_cpu_usage / cpu_samples : 0.0;
-    double avg_fps = (double)frame_count * 1000000.0 / (av_gettime() - start_time);
+    double avg_fps = (double)frame_count * 1000000.0 / (av_gettime() - start_time_total);
+    double avg_conversion_time = conversion_count > 0 ? total_conversion_time / conversion_count : 0.0;
     std::cout << "\nProcessing completed:" << std::endl;
     std::cout << "Total frames processed: " << frame_count << std::endl;
     std::cout << "Average CPU usage: " << avg_cpu_usage << "%" << std::endl;
     std::cout << "Average FPS: " << std::fixed << std::setprecision(1) << avg_fps << std::endl;
+    std::cout << "Average conversion time: " << std::fixed << std::setprecision(3) << avg_conversion_time << "ms" << std::endl;
     std::cout << "Mode: " << (no_resize ? "No resize" : "With resize") 
-              << ", " << (no_record ? "No record" : "With record") << std::endl;
+              << ", " << (no_record ? "No record" : "With record")
+              << ", Color format: " << (use_bgr ? "BGR" : (use_nv12 ? "NV12" : "YUV")) << std::endl;
 
     // Cleanup
     if (!no_record) {

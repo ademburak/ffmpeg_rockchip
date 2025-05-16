@@ -21,9 +21,16 @@ print_usage() {
     done
     echo ""
     echo "Options:"
-    echo "  --no-resize    Disable frame resizing"
-    echo "  --no-record    Disable video recording"
-    echo "  <output.mp4>   Specify output file (default: output.mp4)"
+    echo "  --no-resize         Disable frame resizing"
+    echo "  --no-record         Disable video recording"
+    echo "  --color-format=bgr  Use BGR color format (default)"
+    echo "  --color-format=original  Use original color format"
+    echo "  <output.mp4>        Specify output file (default: output.mp4)"
+    echo ""
+    echo "Examples:"
+    echo "  $0 burak_high                    # Use BGR format (default)"
+    echo "  $0 burak_high --color-format=bgr # Explicitly use BGR format"
+    echo "  $0 burak_high --color-format=original # Use original color format"
 }
 
 # Check if any arguments are provided
@@ -50,8 +57,19 @@ fi
 
 # Output file in /tmp directory
 OUTPUT_FILE="/tmp/output.mp4"
-echo "Output file: $OUTPUT_FILE"
 
-# Run the player with frame resizing
-echo "Running with frame resizing (800x600)"
-./rtsp_player "$RTSP_URL" "$OUTPUT_FILE"
+# Build the command with all arguments
+CMD="./rtsp_player \"$RTSP_URL\""
+for arg in "$@"; do
+    if [[ "$arg" == *.mp4 ]]; then
+        OUTPUT_FILE="$arg"
+    else
+        CMD="$CMD \"$arg\""
+    fi
+done
+CMD="$CMD \"$OUTPUT_FILE\""
+
+echo "Output file: $OUTPUT_FILE"
+echo "Running rtsp_player with provided arguments..."
+echo "Command: $CMD"  # Debug output
+eval $CMD
