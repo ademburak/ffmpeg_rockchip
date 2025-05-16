@@ -4,6 +4,10 @@ extern "C" {
 #include <libavutil/imgutils.h>
 #include <libswscale/swscale.h>
 #include <libavutil/time.h>
+#include <libavutil/hwcontext.h>
+#include <libavutil/hwcontext_drm.h>
+#include <rockchip/rk_mpi.h>
+#include <rockchip/mpp_buffer.h>
 }
 
 #include <opencv2/opencv.hpp>
@@ -52,7 +56,7 @@ double get_cpu_usage() {
 
 int main(int argc, char* argv[]) {
     if (argc < 2) {
-        std::cerr << "Usage: ./rtsp_player <rtsp_url> [--no-record] [--no-resize] [--color-format=bgr|yuv|nv12] [output_file.mp4]" << std::endl;
+        std::cerr << "Usage: ./rtsp_player <rtsp_url> [--no-record] [--no-resize] [--color-format=bgr|yuv|nv12] [--use-mpp] [output_file.mp4]" << std::endl;
         return -1;
     }
 
@@ -61,6 +65,7 @@ int main(int argc, char* argv[]) {
     bool no_resize = false;
     bool use_bgr = false;  // Default to YUV format
     bool use_nv12 = false;
+    bool use_mpp = false;  // Default to OpenCV for conversion
     const char* output_file = "output.mp4";
 
     // Parse arguments
@@ -71,6 +76,9 @@ int main(int argc, char* argv[]) {
             no_record = true;
         } else if (arg == "--no-resize") {
             no_resize = true;
+        } else if (arg == "--use-mpp") {
+            use_mpp = true;
+            std::cout << "Using MPP for color conversion" << std::endl;
         } else if (arg.find("--color-format=") == 0) {
             std::string format = arg.substr(15);  // Length of "--color-format=" is 15
             std::cout << "Parsing color format: " << format << std::endl;  // Debug output
@@ -200,6 +208,40 @@ int main(int argc, char* argv[]) {
                     // Try to open hardware decoder
                     if (avcodec_open2(dec_ctx, decoder, &decoder_opts) >= 0) {
                         std::cout << "Successfully opened hardware decoder" << std::endl;
+                        
+                        // Create hardware device context
+                        AVBufferRef* hw_device_ref = nullptr;
+                        int ret = av_hwdevice_ctx_create(&hw_device_ref, AV_HWDEVICE_TYPE_DRM, "/dev/dri/renderD128", nullptr, 0);
+                        if (ret < 0) {
+                            char err_buf[AV_ERROR_MAX_STRING_SIZE];
+                            av_strerror(ret, err_buf, AV_ERROR_MAX_STRING_SIZE);
+                            std::cout << "Failed to create hardware device context: " << err_buf << std::endl;
+                        } else {
+                            // Create hardware frames context
+                            AVBufferRef* hw_frames_ref = av_hwframe_ctx_alloc(hw_device_ref);
+                            if (hw_frames_ref) {
+                                AVHWFramesContext* hw_frames_ctx = (AVHWFramesContext*)hw_frames_ref->data;
+                                hw_frames_ctx->format = AV_PIX_FMT_DRM_PRIME;
+                                hw_frames_ctx->sw_format = AV_PIX_FMT_YUV420P;
+                                hw_frames_ctx->width = dec_ctx->width;
+                                hw_frames_ctx->height = dec_ctx->height;
+                                hw_frames_ctx->initial_pool_size = 20;
+                                
+                                if (av_hwframe_ctx_init(hw_frames_ref) >= 0) {
+                                    dec_ctx->hw_frames_ctx = av_buffer_ref(hw_frames_ref);
+                                    std::cout << "Hardware frames context initialized" << std::endl;
+                                    std::cout << "Hardware frames format: " << av_get_pix_fmt_name(hw_frames_ctx->sw_format) << std::endl;
+                                    std::cout << "Hardware frames width: " << hw_frames_ctx->width << std::endl;
+                                    std::cout << "Hardware frames height: " << hw_frames_ctx->height << std::endl;
+                                } else {
+                                    std::cout << "Failed to initialize hardware frames context" << std::endl;
+                                }
+                                av_buffer_unref(&hw_frames_ref);
+                            } else {
+                                std::cout << "Failed to allocate hardware frames context" << std::endl;
+                            }
+                            av_buffer_unref(&hw_device_ref);
+                        }
                     } else {
                         std::cout << "Failed to open hardware decoder, falling back to software" << std::endl;
                         avcodec_free_context(&dec_ctx);
@@ -518,14 +560,77 @@ int main(int argc, char* argv[]) {
                             frame->data, frame->linesize, 0, dec_ctx->height,
                             rgb_frame->data, rgb_frame->linesize);
                 } else {
-                    // For no-resize mode, use OpenCV's cvtColor for YUV to BGR conversion
+                    // For no-resize mode, choose between MPP and OpenCV for YUV to BGR conversion
                     if (use_bgr) {
-                        // Create OpenCV Mat from YUV frame
-                        cv::Mat yuv(dec_ctx->height * 3/2, dec_ctx->width, CV_8UC1, frame->data[0]);
-                        cv::Mat bgr(dec_ctx->height, dec_ctx->width, CV_8UC3, rgb_frame->data[0]);
-                        
-                        // Convert YUV to BGR using OpenCV
-                        cv::cvtColor(yuv, bgr, cv::COLOR_YUV2BGR_I420);
+                        if (use_mpp) {
+                            // Get MPP buffer from AVFrame
+                            MppBuffer mpp_buffer = nullptr;
+                            
+                            // First try to get from hw_frames_ctx
+                            if (frame->hw_frames_ctx) {
+                                AVHWFramesContext* hw_frames_ctx = (AVHWFramesContext*)frame->hw_frames_ctx->data;
+                                if (hw_frames_ctx && hw_frames_ctx->hwctx) {
+                                    mpp_buffer = (MppBuffer)hw_frames_ctx->hwctx;
+                                }
+                            }
+                            
+                            // If not found in hw_frames_ctx, try data[3]
+                            if (!mpp_buffer && frame->data[3]) {
+                                mpp_buffer = (MppBuffer)frame->data[3];
+                            }
+                            
+                            // If still not found, try opaque
+                            if (!mpp_buffer && frame->opaque) {
+                                mpp_buffer = (MppBuffer)frame->opaque;
+                            }
+                            
+                            if (mpp_buffer) {
+                                std::cout << "Using MPP buffer for conversion" << std::endl;
+                                // Create MPP frame for output
+                                MppFrame mpp_frame = NULL;
+                                mpp_frame_init(&mpp_frame);
+                                
+                                // Set up MPP frame parameters
+                                mpp_frame_set_width(mpp_frame, dec_ctx->width);
+                                mpp_frame_set_height(mpp_frame, dec_ctx->height);
+                                mpp_frame_set_fmt(mpp_frame, MPP_FMT_BGR888);
+                                
+                                // Get MPP buffer for output
+                                MppBuffer out_buffer = NULL;
+                                size_t size = dec_ctx->width * dec_ctx->height * 3;  // BGR format
+                                mpp_buffer_get(NULL, &out_buffer, size);
+                                
+                                if (out_buffer) {
+                                    // Set output buffer to MPP frame
+                                    mpp_frame_set_buffer(mpp_frame, out_buffer);
+                                    
+                                    // Convert using MPP
+                                    MPP_RET ret = mpp_frame_init(&mpp_frame);
+                                    if (ret == MPP_OK) {
+                                        // Copy converted data to output frame
+                                        void* data = mpp_buffer_get_ptr(out_buffer);
+                                        memcpy(rgb_frame->data[0], data, size);
+                                    }
+                                    
+                                    // Release MPP buffer
+                                    mpp_buffer_put(out_buffer);
+                                }
+                                
+                                // Release MPP frame
+                                mpp_frame_deinit(&mpp_frame);
+                            } else {
+                                std::cout << "MPP buffer not available, falling back to OpenCV" << std::endl;
+                                // Fallback to OpenCV
+                                cv::Mat yuv(dec_ctx->height * 3/2, dec_ctx->width, CV_8UC1, frame->data[0]);
+                                cv::Mat bgr(dec_ctx->height, dec_ctx->width, CV_8UC3, rgb_frame->data[0]);
+                                cv::cvtColor(yuv, bgr, cv::COLOR_YUV2BGR_I420);
+                            }
+                        } else {
+                            // Use OpenCV for conversion
+                            cv::Mat yuv(dec_ctx->height * 3/2, dec_ctx->width, CV_8UC1, frame->data[0]);
+                            cv::Mat bgr(dec_ctx->height, dec_ctx->width, CV_8UC3, rgb_frame->data[0]);
+                            cv::cvtColor(yuv, bgr, cv::COLOR_YUV2BGR_I420);
+                        }
                     } else {
                         // If formats match, just copy the frame
                         if (av_frame_copy(rgb_frame, frame) < 0) {
@@ -657,6 +762,9 @@ int main(int argc, char* argv[]) {
     std::cout << "Mode: " << (no_resize ? "No resize" : "With resize") 
               << ", " << (no_record ? "No record" : "With record")
               << ", Color format: " << (use_bgr ? "BGR" : (use_nv12 ? "NV12" : "YUV")) << std::endl;
+    std::cout << "Total conversion time: " << std::fixed << std::setprecision(3) << total_conversion_time << "ms" << std::endl;
+    std::cout << "Conversion overhead: " << std::fixed << std::setprecision(1) 
+              << (total_conversion_time / (av_gettime() - start_time_total) * 100.0) << "%" << std::endl;
 
     // Cleanup
     if (!no_record) {
